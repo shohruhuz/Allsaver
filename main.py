@@ -28,7 +28,7 @@ class AdminStates(StatesGroup):
     waiting_for_ad = State()
     waiting_for_channel = State()
 
-# --- ANIMATSIYALI PROGRESS BAR ---
+# --- PROGRESS BAR ---
 def get_progress_bar(current, total):
     percentage = current / total
     completed = int(percentage * 10)
@@ -44,8 +44,8 @@ async def edit_status(message, text, last_update_time):
     except:
         pass
 
-# --- YUKLASH FUNKSIYASI ---
-async def download_media(url, mode, status_msg, quality="720"):
+# --- YUKLASH FUNKSIYASI (ffmpeg talab qilmaydi) ---
+async def download_media(url, status_msg):
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
     
@@ -69,29 +69,24 @@ async def download_media(url, mode, status_msg, quality="720"):
                     asyncio.get_event_loop()
                 )
 
-    quality_chain = ["720", "480", "360"]
-    start_idx = quality_chain.index(quality) if quality in quality_chain else 0
+    # Birinchi navbatda 50MB dan kichik, so'ngra umuman eng kichigini tanlash
+    formats_to_try = [
+        'bestvideo[height<=720]+bestaudio/best[height<=720]/best',  # birlashtirish (ffmpeg talab qiladi) — ishlamasa, keyingi
+        'best[height<=720][filesize<50M]/best[height<=480][filesize<50M]/best[height<=360][filesize<50M]',
+        'best[filesize<50M]/best',  # hajmga qaramasdan, lekin 50MB dan kichik
+        'worstvideo+worstaudio/worst',  # oxirgi chora
+        'best'  # mutlaq oxirgi
+    ]
 
-    for q in quality_chain[start_idx:]:
+    for fmt in formats_to_try:
         ydl_opts = {
             'outtmpl': 'downloads/%(id)s.%(ext)s',
             'progress_hooks': [progress_hook],
-            'quiet': True,
+            'quiet': False,          # ✅ Xatolarni ko'rish uchun
+            'no_warnings': False,
             'noplaylist': True,
-            'no_warnings': True,
+            'format': fmt,
         }
-
-        if mode == "mp3":
-            # MP3: ffmpeg talab qiladi. Agar yo'q bo'lsa, m4a qaytariladi
-            ydl_opts['format'] = 'bestaudio[ext=m4a][filesize<20M]/bestaudio[filesize<20M]'
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',
-            }]
-        else:
-            # Video: muxlangan, 50MB dan kichik
-            ydl_opts['format'] = f'best[height<={q}][filesize<50M]/best[height<={q}]/best[filesize<50M]'
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -99,25 +94,19 @@ async def download_media(url, mode, status_msg, quality="720"):
                 info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
                 filename = ydl.prepare_filename(info)
 
-                if mode == "mp3":
-                    mp3_file = os.path.splitext(filename)[0] + '.mp3'
-                    if os.path.exists(mp3_file):
-                        return mp3_file
-                    elif os.path.exists(filename):
-                        return filename  # m4a yoki boshqa audio
-                    else:
-                        continue
+                if os.path.exists(filename):
+                    # Agar fayl 50MB dan katta bo'lsa ham, Telegram qabul qilmasa keyinroq xato beradi
+                    file_size = os.path.getsize(filename)
+                    if file_size > 50 * 1024 * 1024:
+                        logging.warning(f"Fayl hajmi 50MB dan ortiq: {file_size / (1024*1024):.1f}MB")
+                        # Qabul qilishga harakat qilamiz, lekin Telegram xato qaytarishi mumkin
+                    return filename
                 else:
-                    if os.path.exists(filename):
-                        return filename
-                    else:
-                        continue
+                    continue
 
         except Exception as e:
-            logging.error(f"Yuklashda xato ({q}p): {e}")
-            if "File is larger than" in str(e) and q != "360":
-                continue
-            return "error"
+            logging.error(f"Format {fmt} ishlamadi: {e}")
+            continue
 
     return "error"
 
@@ -143,9 +132,9 @@ async def start(message: types.Message):
         "👋 <b>Assalomu alaykum!</b>\n\n"
         "🤖 Men YouTube, Instagram, TikTok, Likee, Pinterest, VK va boshqalardan video yuklovchi botman.\n\n"
         "📌 <b>Imkoniyatlarim:</b>\n"
-        "— Video: maksimal 50MB\n"
-        "— Audio: maksimal 20MB\n"
-        "— Avtomatik sifat tanlovi\n\n"
+        "— Video: 50MB gacha (Telegram chegarasi)\n"
+        "— Audio: 20MB gacha\n"
+        "— Avtomatik format tanlash\n\n"
         "📩 Menga video havolasini yuboring!"
     )
     await message.answer(start_text)
@@ -159,49 +148,35 @@ async def handle_url(message: types.Message):
             kb.add(InlineKeyboardButton("A'zo bo'lish", url=ch['url']))
         return await message.answer("⚠️ Botdan foydalanish uchun kanallarga obuna bo'ling!", reply_markup=kb)
 
-    kb = InlineKeyboardMarkup(row_width=2)
     url = message.text
-    if "youtube.com" in url or "youtu.be" in url:
-        kb.add(
-            InlineKeyboardButton("720p 🎥", callback_data="dl_720"),
-            InlineKeyboardButton("MP3 🎵", callback_data="dl_mp3")
-        )
-    else:
-        kb.add(InlineKeyboardButton("📥 Yuklash", callback_data="dl_best"))
+    # YouTube uchun alohida tugma kerak emas — avtomatik yuklaydi
+    msg = await message.reply("⏳ <b>Yuklanmoqda... Iltimos, kuting.</b>")
     
-    await message.reply("⚙️ <b>Hajm tekshirilmoqda. Formatni tanlang:</b>", reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('dl_'))
-async def dl_callback(call: CallbackQuery):
-    q = call.data.replace("dl_", "")
-    if not call.message.reply_to_message:
-        return await call.answer("Havola topilmadi!", show_alert=True)
-    
-    url = call.message.reply_to_message.text
-    msg = await call.message.edit_text("🛰 <b>Serverga ulanmoqda...</b>")
-    
-    path = await download_media(url, q, msg, q if q.isdigit() else "720")
+    path = await download_media(url, msg)
     
     if path == "error":
         await msg.edit_text(
             "❌ <b>Ushbu videoni yuklab bo'lmaydi.</b>\n"
-            "Ehtimol, hajmi 50MB (video) yoki 20MB (audio) dan ortiq, "
-            "yoki platforma yuklashga ruxsat bermaydi."
+            "Sabablari:\n"
+            "— Video yoki audio qo'llab-quvvatlanmaydi,\n"
+            "— Platforma yuklashga to'sqinlik qiladi,\n"
+            "— Tarmoqda muammo.\n\n"
+            "Iltimos, boshqa havolani sinab ko'ring."
         )
         return
 
     await msg.edit_text("📤 <b>Telegramga yuborilmoqda...</b>")
     try:
-        with open(path, 'rb') as f:
-            if q == "mp3":
-                if path.endswith('.mp3'):
-                    await call.message.answer_audio(f, caption="@Allsaver")
+        file_size = os.path.getsize(path)
+        if file_size > 50 * 1024 * 1024:
+            await msg.edit_text("❌ <b>Fayl hajmi 50MB dan ortiq. Telegram qabul qilmaydi.</b>")
+        else:
+            with open(path, 'rb') as f:
+                if path.endswith(('.mp3', '.m4a', '.ogg', '.opus')):
+                    await message.answer_audio(f, caption="@Allsaver")
                 else:
-                    # m4a, ogg kabi formatlar
-                    await call.message.answer_voice(f, caption="@Allsaver")
-            else:
-                await call.message.answer_video(f, caption="@Allsaver")
-        await msg.delete()
+                    await message.answer_video(f, caption="@Allsaver")
+            await msg.delete()
     except Exception as e:
         logging.error(f"Yuborishda xato: {e}")
         await msg.edit_text("❌ Yuborishda xatolik yuz berdi.")
@@ -209,7 +184,7 @@ async def dl_callback(call: CallbackQuery):
         if path and os.path.exists(path):
             os.remove(path)
 
-# --- ADMIN PANEL ---
+# --- ADMIN PANEL (o'zgarmagan) ---
 @dp.message_handler(commands=['admin'], user_id=ADMIN_ID)
 async def admin(message: types.Message):
     kb = InlineKeyboardMarkup(row_width=2)
@@ -261,7 +236,7 @@ async def a_stat(call: CallbackQuery):
     count = await users_col.count_documents({})
     await call.message.answer(f"👤 Foydalanuvchilar: {count} ta")
 
-# --- WEB SERVER (Render uchun) ---
+# --- WEB SERVER ---
 async def web_h(r):
     return web.Response(text="Bot is Active")
 
